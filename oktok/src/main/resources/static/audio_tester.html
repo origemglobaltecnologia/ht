@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Teste de WebSocket de Áudio</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+        #log { max-height: 200px; overflow-y: auto; }
+        .log-entry { font-size: 0.8rem; padding: 5px; border-bottom: 1px solid #eee; }
+        .connected { animation: pulse-green 1.5s infinite; }
+        .disconnected { background-color: #ef4444; }
+
+        @keyframes pulse-green {
+            0% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7); }
+            70% { box-shadow: 0 0 0 10px rgba(34, 197, 94, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+        }
+    </style>
+</head>
+<body class="bg-gray-50 flex items-center justify-center min-h-screen p-4">
+
+    <div class="max-w-md w-full bg-white shadow-xl rounded-xl p-6 space-y-6">
+        <h1 class="text-3xl font-bold text-gray-800 text-center">Transmissão de Áudio WebSocket</h1>
+
+        <div class="flex items-center justify-between p-4 bg-indigo-50 rounded-lg shadow-inner">
+            <span class="text-indigo-700 font-semibold">Status da Conexão:</span>
+            <div class="flex items-center">
+                <span id="status" class="status-indicator w-3 h-3 rounded-full mr-2 bg-red-500 disconnected"></span>
+                <span id="statusText" class="font-medium text-red-600">Desconectado</span>
+            </div>
+        </div>
+
+        <div class="flex space-x-3">
+            <button id="connectButton"
+                class="flex-1 px-4 py-2 bg-indigo-600 text-white font-semibold rounded-lg shadow-md hover:bg-indigo-700 transition duration-150">
+                Conectar
+            </button>
+            <button id="startButton" disabled
+                class="flex-1 px-4 py-2 bg-green-500 text-white font-semibold rounded-lg shadow-md hover:bg-green-600 transition duration-150 disabled:bg-gray-400">
+                Iniciar Gravação e Envio
+            </button>
+            <button id="stopButton" disabled
+                class="flex-1 px-4 py-2 bg-red-500 text-white font-semibold rounded-lg shadow-md hover:bg-red-600 transition duration-150 disabled:bg-gray-400">
+                Parar
+            </button>
+        </div>
+
+        <h2 class="text-xl font-semibold text-gray-700 pt-4">Áudio Recebido</h2>
+        <p class="text-sm text-gray-500">O áudio transmitido por outros clientes será reproduzido automaticamente.</p>
+        <p id="audio-status" class="text-sm text-yellow-600">Áudio desbloqueado. Tentando reprodução...</p>
+
+        <h2 class="text-xl font-semibold text-gray-700 pt-4">Log de Eventos</h2>
+        <div id="log" class="bg-gray-100 border border-gray-300 rounded-lg p-2 text-gray-800">
+            </div>
+    </div>
+
+    <script>
+        // *** CONFIGURAÇÃO ***
+        const WEBSOCKET_URL = "ws://localhost:8080/audio";
+        const CHUNK_SIZE_MS = 250; // Frequência de envio de áudio em milissegundos
+        const PLAYBACK_DELAY_MS = 1500; // Tempo para esperar antes de reproduzir o buffer (latência)
+        const AUDIO_MIME_TYPE = 'audio/webm; codecs=opus';
+        const MIN_AUDIO_CHUNK_SIZE = 100; // Mínimo de bytes para um chunk ser considerado válido
+        // ********************
+
+        const logDiv = document.getElementById('log');
+        const statusIndicator = document.getElementById('status');
+        const statusText = document.getElementById('statusText');
+        const connectButton = document.getElementById('connectButton');
+        const startButton = document.getElementById('startButton');
+        const stopButton = document.getElementById('stopButton');
+        const audioStatus = document.getElementById('audio-status');
+
+        let ws = null;
+        let mediaRecorder = null;
+        let stream = null;
+
+        // --- VARIÁVEIS DE BUFFERIZAÇÃO ---
+        let audioChunksBuffer = [];
+        let audioPlaybackTimeout = null;
+
+        // --- Funções de Log e Status ---
+
+        function logMessage(message, type = 'info') {
+            const p = document.createElement('p');
+            let color = 'text-gray-800';
+            if (type === 'error') { color = 'text-red-600 font-medium'; message = '🚨 ' + message; }
+            if (type === 'success') { color = 'text-green-600 font-medium'; message = '✅ ' + message; }
+            if (type === 'outgoing') { color = 'text-indigo-600'; message = '➡️ ' + message; }
+            if (type === 'incoming') { color = 'text-blue-600'; message = '🎶 ' + message; }
+
+            p.className = `log-entry ${color}`;
+            p.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            logDiv.prepend(p);
+        }
+
+        function updateStatus(isConnected) {
+            if (isConnected) {
+                statusIndicator.className = 'status-indicator w-3 h-3 rounded-full mr-2 bg-green-500 connected';
+                statusText.textContent = 'Conectado';
+                statusText.classList.remove('text-red-600');
+                statusText.classList.add('text-green-600');
+                connectButton.disabled = true;
+                startButton.disabled = false;
+            } else {
+                statusIndicator.className = 'status-indicator w-3 h-3 rounded-full mr-2 bg-red-500 disconnected';
+                statusText.textContent = 'Desconectado';
+                statusText.classList.remove('text-green-600');
+                statusText.classList.add('text-red-600');
+                connectButton.disabled = false;
+                startButton.disabled = true;
+                stopButton.disabled = true;
+            }
+        }
+
+        // --- Gerenciamento do WebSocket ---
+
+        function connectWebSocket() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                logMessage("Já conectado.");
+                return;
+            }
+
+            logMessage("Tentando conectar...");
+            ws = new WebSocket(WEBSOCKET_URL);
+
+            ws.onopen = () => {
+                logMessage("Conexão WebSocket estabelecida.", 'success');
+                updateStatus(true);
+            };
+
+            ws.onmessage = (event) => {
+                if (event.data instanceof Blob) {
+                    handleReceivedAudioChunk(event.data);
+                } else if (event.data === "STREAM_STOPPED") {
+                    // Sinal de parada de um cliente. Isso deve acionar a reprodução imediata.
+                    logMessage("Sinal de parada de transmissão recebido. Reproduzindo buffer restante.", 'info');
+                    
+                    // MELHORIA: Cancela o timeout para evitar reprodução dupla
+                    if (audioPlaybackTimeout) {
+                        clearTimeout(audioPlaybackTimeout);
+                        audioPlaybackTimeout = null;
+                    }
+
+                    // Chama a reprodução e limpa o buffer
+                    playBufferedAudio();
+                } else {
+                    logMessage(`Mensagem de texto recebida: ${event.data}`);
+                }
+            };
+
+            ws.onclose = (event) => {
+                logMessage(`Conexão WebSocket fechada. Código: ${event.code}. Razão: ${event.reason}`, 'error');
+                updateStatus(false);
+                stopRecordingAndSending(false);
+                ws = null;
+            };
+
+            ws.onerror = (error) => {
+                logMessage(`Erro no WebSocket. Verifique se o servidor está rodando na porta 8080.`, 'error');
+                updateStatus(false);
+            };
+        }
+
+        // --- NOVO: Tratamento de Chunks Recebidos e Bufferização ---
+        function handleReceivedAudioChunk(audioBlob) {
+            // Proteção: Ignora chunks muito pequenos que não são dados de áudio WebM válidos.
+            if (audioBlob.size < MIN_AUDIO_CHUNK_SIZE) {
+                logMessage(`⚠️ Chunk de áudio ignorado (muito pequeno): ${audioBlob.size} bytes.`, 'info');
+                return;
+            }
+
+            // 1. Armazena o chunk no buffer
+            audioChunksBuffer.push(audioBlob);
+            logMessage(`🎶 Áudio recebido (${audioBlob.size} bytes). Buffer: ${audioChunksBuffer.length} chunks.`, 'incoming');
+
+            // 2. Limpa o timeout anterior (se um chunk chegou, o stream não parou)
+            if (audioPlaybackTimeout) {
+                clearTimeout(audioPlaybackTimeout);
+                audioPlaybackTimeout = null; // MELHORIA: Garante que a variável é resetada
+            }
+
+            // 3. Define um novo timeout. Se o fluxo parar por PLAYBACK_DELAY_MS,
+            //    tenta reproduzir o buffer acumulado.
+            audioPlaybackTimeout = setTimeout(playBufferedAudio, PLAYBACK_DELAY_MS);
+        }
+
+        function playBufferedAudio() {
+            // Sai se o buffer estiver vazio 
+            if (audioChunksBuffer.length === 0) return;
+
+            // 1. Concatena todos os Blobs no buffer para formar um único arquivo WebM/Opus válido
+            const completeBlob = new Blob(audioChunksBuffer, { type: AUDIO_MIME_TYPE });
+
+            // 2. Limpa o buffer para o próximo ciclo
+            audioChunksBuffer = [];
+
+            // 3. Tenta reproduzir o arquivo completo
+            const audioUrl = URL.createObjectURL(completeBlob);
+            const audio = new Audio(audioUrl);
+
+            // Tenta reproduzir.
+            audio.play()
+                .then(() => {
+                    logMessage(`✅ Buffer de áudio (${completeBlob.size} bytes) reproduzido com SUCESSO.`, 'success');
+                    audioStatus.textContent = `Reproduzindo ${completeBlob.size} bytes.`;
+                })
+                .catch(e => {
+                    logMessage(`🚨 Erro na decodificação ou reprodução do áudio: ${e.message}`, 'error');
+                    // Pode ser o erro de bloqueio de autoplay (NotAllowedError)
+                    audioStatus.textContent = "Erro na reprodução. Tente interagir com a página para desbloquear o ÁudioContext (clique em um botão).";
+                });
+
+            // 4. Limpeza após a reprodução (ou falha)
+            audio.onended = () => {
+                URL.revokeObjectURL(audioUrl);
+                audioStatus.textContent = "Áudio desbloqueado. Tentando reprodução...";
+            };
+        }
+
+        // --- Captura e Envio de Áudio ---
+
+        async function startRecordingAndSending() {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                logMessage("Conecte-se primeiro ao WebSocket.", 'error');
+                return;
+            }
+
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                logMessage("Acesso ao microfone concedido. Iniciando stream...", 'success');
+
+                const options = MediaRecorder.isTypeSupported(AUDIO_MIME_TYPE) ? { mimeType: AUDIO_MIME_TYPE } : {};
+                mediaRecorder = new MediaRecorder(stream, options);
+
+                mediaRecorder.start(CHUNK_SIZE_MS);
+
+                mediaRecorder.ondataavailable = (event) => {
+                    if (event.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+                        ws.send(event.data);
+                        logMessage(`➡️ Enviando chunk de áudio (${event.data.size} bytes).`, 'outgoing');
+                    }
+                };
+
+                mediaRecorder.onstop = () => {
+                    logMessage("Gravação parada. Enviando sinal de parada para o servidor.", 'info');
+                };
+
+                startButton.disabled = true;
+                stopButton.disabled = false;
+                logMessage("Início da transmissão periódica de áudio.", 'info');
+
+            } catch (err) {
+                logMessage(`🚨 Erro ao acessar o microfone: ${err.name}. É necessário HTTPS ou localhost.`, 'error');
+            }
+        }
+
+        function stopRecordingAndSending(sendSignal = true) {
+            // Se o MediaRecorder estiver ativo, pare a gravação
+            if (mediaRecorder && mediaRecorder.state !== "inactive") {
+                mediaRecorder.stop();
+            }
+            // Se o stream do microfone estiver ativo, pare o uso do microfone
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+                stream = null;
+            }
+
+            // 1. Envia um sinal de parada como mensagem de texto para o servidor
+            if (sendSignal && ws && ws.readyState === WebSocket.OPEN) {
+                 ws.send("STREAM_STOPPED");
+                 logMessage("➡️ Sinal 'STREAM_STOPPED' enviado ao servidor.", 'outgoing');
+            }
+
+            startButton.disabled = false;
+            stopButton.disabled = true;
+            logMessage("Gravação e envio de áudio parados.", 'info');
+        }
+
+        // --- Listeners de Botões ---
+        connectButton.addEventListener('click', connectWebSocket);
+        startButton.addEventListener('click', startRecordingAndSending);
+        // O botão 'Parar' agora chama stopRecordingAndSending com o sinal de envio
+        stopButton.addEventListener('click', () => stopRecordingAndSending(true));
+
+    </script>
+</body>
+</html>
+
